@@ -1,0 +1,1161 @@
+/**
+ * @file      HttpsBuiltlnPost.ino
+ * @author    Lewis He (lewishe@outlook.com)
+ * @license   MIT
+ * @copyright Copyright (c) 2023  Shenzhen Xin Yuan Electronic Technology Co., Ltd
+ * @date      2023-11-29
+ * @note
+ * * Example is suitable for A7670X/A7608X/SIM7670G/SIM7000G/SIM7600 series
+ * * Connect https://httpbin.org test post request
+ * * Example uses a forked TinyGSM <https://github.com/lewisxhe/TinyGSM>, which will not compile successfully using the mainline TinyGSM.
+ */
+#define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
+
+// See all AT commands, if wanted
+// #define DUMP_AT_COMMANDS
+
+#include "utilities.h"
+#include <TinyGsmClient.h>
+#include <driver/gpio.h>
+
+//added
+#include <Arduino.h>
+#include <Wire.h>
+#include <MPU9250_asukiaaa.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+#include <SoftwareSerial.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <math.h>
+#include <daly-bms-uart.h>
+TinyGPSPlus gps;
+MPU9250_asukiaaa mpu;
+#define BOARD_GPS_TX_PIN                    0//36//21
+#define BOARD_GPS_RX_PIN                    39//22
+#define SerialGPS Serial2
+#define buzzerPin 15
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// GPS
+float latitude = 1.2962018;     //Storing the Latitude
+float longitude = 103.776899437848;    //Storing the Longitude
+//Ice cave/E1A : 1.299610, 103.77770683
+float velocity;    //Variable  to store the velocity
+float speed_mps;
+String bearing;    //Variable to store orientation or direction of GPS
+String HTTPtime = "";  //Variable to store time for HTTP post
+String timeStr;    //Variable to store time from modem
+
+// Fall/Ditch Detection
+// indicating a state of freefall. (1g = 9.8 m/s^2)
+const float FALL_ACCEL_THRESHOLD = 9.0;
+const float g = 9.80665; //gravitational acceleration
+// --- State Variables ---
+bool potentialFall = false;
+unsigned long lastUpdateTime = 0;
+const unsigned long SENSOR_READ_INTERVAL = 1000; // Read sensors every 100ms
+float Gyro = 0;
+float Accel = 0;
+const int numReadings = 10;    // Number of readings to average
+float readingsAccel[numReadings];     // Array to store readings
+float totalAccel = 0;                 // Sum of readings
+float averageAccel = 0;   
+float readingsGyro[numReadings];     // Array to store readings
+float totalGyro= 0;                 // Sum of readings
+float averageGyro = 0;  
+int count = 0; 
+bool zeroing = false;
+int ind = 10;
+float roll = 0;
+float pitch = 0;
+unsigned long fallTime = 0;
+const unsigned long stillTime = 5000; // seconds of stillness
+const int looptime = 1000;//every loop is 500ms for topple detection
+unsigned long printTime = 0;
+unsigned long postTime = 0;
+const unsigned long postInterval = 15000; // 15 seconds for each HTTP post
+String pmaState = "Safe";
+
+//ESP-NOW
+// GLOBALS
+int previous_soc = -1;
+int input_soc = -1;        // to store user input
+int previous_chg = -1;     // 0 = not charging, 1 = charging
+int input_chg = -1;        // to store user input
+float input_I = -1.0;      // Current in Amperes, +ve charge, -ve discharge
+float input_resmAh = -1.0; // Remaining capacity in mAh
+
+const char *current_status_msg = "";
+const char *previous_status_msg = "";
+
+// Define a data structure
+//! Has to be the same as the struct in the Initiator
+typedef struct struct_message
+{
+    bool bms_status;
+    float soc;
+    float I;
+    float resmAh;
+} struct_message;
+
+// Create a structure object
+struct_message BMSData;
+
+void formatMacAddress(const uint8_t *macAddr, char *buffer, int maxLength)
+// Formats MAC Address
+{
+    snprintf(buffer, maxLength, "%02x:%02x:%02x:%02x:%02x:%02x", macAddr[0], macAddr[1], macAddr[2], macAddr[3], macAddr[4], macAddr[5]);
+}
+
+void statusMessage(int soc, int chg)
+{
+    current_status_msg = "";
+
+    if (chg && soc < 100)
+    {
+        current_status_msg = "BATTERY CHARGING";
+    }
+    else if (chg && soc == 100)
+    {
+        current_status_msg = "BATTERY FULL!";
+    }
+    else if (soc <= 20)
+    {
+        current_status_msg = "BATTERY LOW PLEASE CHARGE";
+    }
+}
+
+// Callback function that you want executed when data is received
+// The arguments of the callback function are fixed to be this three.
+unsigned long lastReceiveTime = 0;
+const int printInterval = 5000; // print every 2 seconds
+void receiveCallback(const uint8_t *macAddr, const uint8_t *incomingData, int dataLen)
+{
+    // Only allow a maximum of 250 characters in the message
+    if (dataLen > ESP_NOW_MAX_DATA_LEN)
+    {
+        return;
+    }
+
+    char macStr[18];
+    formatMacAddress(macAddr, macStr, 18);
+    // Send Debug log message to the serial port
+    Serial.println("----------------------------------------------------");
+    Serial.printf("Received message from: %s\n", macStr);
+
+    memcpy(&BMSData, incomingData, sizeof(BMSData));
+    Serial.print("Data received: ");
+    Serial.println(dataLen);
+    if (millis() - lastReceiveTime > printInterval)
+    {
+    Serial.print("BMS Status Received: ");
+    Serial.println(BMSData.bms_status);
+    Serial.print("BMS SoC Received: ");
+    Serial.println(BMSData.soc);
+    Serial.print("BMS Current Received: ");
+    Serial.println(BMSData.I);
+    Serial.print("BMS Remaining Capacity (mAh) Received: ");
+    Serial.println(BMSData.resmAh);
+    Serial.println();
+    }
+    input_soc = (int)ceilf(BMSData.soc); // ceiling to nearest upper int
+    input_chg = (BMSData.I > 0.5) ? 1 : 0;
+    // +ve charging, -ve discharging
+    // Charging: +0-2A
+    // OFF: ±0.0003A
+    // Discharging: IDLE -0.037 to -0.04A, Reverse & Forward: -2 to -21A
+    // However, due to the BMS low current reading resolution, it is more reliable to put > +0.5A as charging, and anything smaller as not charging.
+    statusMessage(input_soc, input_chg); // Updates current_status_message
+    input_I = BMSData.I;                 // +A charge, -A discharge
+    input_resmAh = BMSData.resmAh;
+
+    if (millis() - lastReceiveTime > printInterval) 
+    {
+    Serial.print("Current SoC: ");
+    Serial.println(input_soc);
+    Serial.print("Current Charge Status: ");
+    Serial.println(input_chg);
+    Serial.print("Current Status Message: ");
+    Serial.println(current_status_msg);
+    Serial.print("Current: ");
+    Serial.println(input_I);
+    Serial.print("Remaining Capacity (mAh): ");
+    Serial.println(input_resmAh);
+
+    Serial.print("Previous SoC: ");
+    Serial.println(previous_soc);
+    Serial.print("Previous Charge Status: ");
+    Serial.println(previous_chg);
+    Serial.print("Previous Status Message: ");
+    Serial.println(previous_status_msg);
+    lastReceiveTime = millis();
+    }
+    // Update previous values
+    previous_soc = input_soc;
+    previous_chg = input_chg;
+    previous_status_msg = current_status_msg;
+}
+
+#ifdef DUMP_AT_COMMANDS // if enabled it requires the streamDebugger lib
+#include <StreamDebugger.h>
+StreamDebugger debugger(SerialAT, Serial);
+TinyGsm modem(debugger);
+#else
+TinyGsm modem(SerialAT);
+#endif
+
+String convertToUTC(String timeStr) {
+    // Example input: "25/10/24,15:22:34+32"
+    timeStr.trim();
+    timeStr.replace("\"", ""); // remove double quotes
+    int year   = timeStr.substring(0, 2).toInt();
+    int month  = timeStr.substring(3, 5).toInt();
+    int day    = timeStr.substring(6, 8).toInt();
+    int hour   = timeStr.substring(9, 11).toInt();
+    int minute = timeStr.substring(12, 14).toInt();
+    int second = timeStr.substring(15, 17).toInt();
+    Serial.println("Parsed Time - Y:" + String(year) + " M:" + String(month) + 
+                " D:" + String(day) + " H:" + String(hour) + 
+                " Min:" + String(minute) + " S:" + String(second));
+    year = 2000 + year; // make full year (e.g. 2025)
+    // Adjust timezone: Singapore (UTC+8) → UTC (minus 8 hours)
+    hour -= 8;
+    if (hour < 0) {
+        hour += 24;
+        day -= 1;
+        if (day <= 0) {// Handle day wrap-around (simple version)
+            month -= 1;
+            if (month <= 0) {
+                month = 12;
+                year -= 1;
+            }
+            // Get number of days in previous month
+            int daysInMonth;
+            if (month == 1 || month == 3 || month == 5 || month == 7 ||
+                month == 8 || month == 10 || month == 12) {
+                daysInMonth = 31;
+            } else if (month == 4 || month == 6 || month == 9 || month == 11) {
+                daysInMonth = 30;
+            } else { // February
+                daysInMonth = (year % 4 == 0) ? 29 : 28;
+            }
+            day = daysInMonth;
+        }
+    }
+    // Reconstruct the new UTC time string
+    char buffer[36];
+    sprintf(buffer, "%04d-%02d-%02dT%02d:%02d:%02d+08:00",
+            year, month, day, hour, minute, second);
+
+    return String(buffer);
+}
+
+// It depends on the operator whether to set up an APN. If some operators do not set up an APN,
+// they will be rejected when registering for the network. You need to ask the local operator for the specific APN.
+// APNs from other operators are welcome to submit PRs for filling.
+// #define NETWORK_APN     "CHN-CT"             //CHN-CT: China Telecom
+const char *server_url = "https://senditemalert-tg3jk3roea-as.a.run.app";
+
+void postData() 
+{
+    float lat = gps.location.lat();
+    float lng = gps.location.lng();
+    float vel = gps.speed.kmph();
+    float spd = gps.speed.mps();
+    float accuracy = gps.satellites.value();
+    String HTTPtime = "";
+    // HTTPtime += String(gps.date.year());
+    // HTTPtime += "-";
+    // if (gps.date.month() < 10) HTTPtime += "0";
+    // HTTPtime += String(gps.date.month());
+    // HTTPtime += "-";
+    // if (gps.date.day() < 10) HTTPtime += "0";
+    // HTTPtime += String(gps.date.day());
+    // HTTPtime += "T";
+    // int sg_hour = gps.time.hour() + 0; // Singapore is UTC +8, change this according to your timezone
+    // if (sg_hour >= 24) sg_hour -= 24; // wrap around midnight
+    // if (sg_hour < 10) HTTPtime += "0";
+    // HTTPtime += String(sg_hour);
+    // // if (gps.time.hour() < 10) HTTPtime += "0";
+    // // HTTPtime += String(gps.time.hour());
+    // HTTPtime += ":";
+    // if (gps.time.minute() < 10) HTTPtime += "0";
+    // HTTPtime += String(gps.time.minute());
+    // HTTPtime += ":";
+    // if (gps.time.second() < 10) HTTPtime += "0";
+    // HTTPtime += String(gps.time.second());
+    // HTTPtime += "+08:00"; // add timezone info, change this according to your timezone
+    // Serial.println("Time: " + HTTPtime);
+
+    String modemTime;
+    modem.sendAT("+CCLK?");
+    if (modem.waitResponse(1000, "+CCLK:") == 1) {
+    modemTime = modem.stream.readStringUntil('\n');
+    timeStr.trim();
+    Serial.println("Module time: " + modemTime);
+    }
+    //Module time: "25/10/24,15:22:34+32"
+    HTTPtime = convertToUTC(modemTime);
+    Serial.println("UTC time: " + HTTPtime);
+    // HTTPtime += "20";
+    // HTTPtime += timeStr.substring(1, 3);  // year "25"
+    // HTTPtime += "-";
+    // HTTPtime += timeStr.substring(4, 6);  // month "10"
+    // HTTPtime += "-";
+    // HTTPtime += timeStr.substring(7, 9);  // day "24"
+    // HTTPtime += "T";
+    // HTTPtime += timeStr.substring(10, 18); // "15:22:34"
+    // HTTPtime += "+08:00";                 // timezone
+    // Serial.println("Time: " + HTTPtime);
+
+    // // Initialize HTTPS
+    modem.https_begin();
+
+    // Set GET URT
+    if (!modem.https_set_url(server_url))
+    {
+        Serial.println("Failed to set the URL. Please check the validity of the URL!");
+        return;
+    }
+
+    // Build the HTTPS POST request header (the below are just some random header examples)
+    // modem.https_add_header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6");
+    // modem.https_add_header("Accept-Encoding", "gzip, deflate, br");
+    modem.https_add_header("Content-Type", "application/json");
+    modem.https_add_header("Accept", "application/json");
+
+    // modem.https_set_user_agent("TinyGSM/LilyGo-A76XX");
+
+    // Build the HTTPS POST request body
+    // String post_body = "This is post example!";
+    //String post_body = String("{\"itemId\":\"0009\",") + "\"location\":{\"lat\":1.35210,\"lng\":103.81980,\"accuracy\":12}," + "\"at\":\"2025-08-09T10:22:00+08:00\"," + "\"severity\":\"warning\"}";
+    // String post_body = String("{\"itemId\":\"0001\",") + "\"location\":{\"lat\":" + String(gps.location.lat(), 5) + ",\"lng\":" + String(gps.location.lng(), 5)+ ",\"accuracy\":" + String(gps.satellites.value())+ "}," + "\"at\":\"" + time + "\"," + "\"severity\":\"" + pmaState + "\"" + "}";
+    String post_body;
+    post_body.reserve(512);  // prevent repeated reallocations
+    post_body = "{\"itemId\":\"0001\",";
+    post_body += "\"location\":{\"lat\":";
+    post_body += String(lat, 5);
+    post_body += ",\"lng\":";
+    post_body += String(lng, 5);
+    post_body += ",\"accuracy\":";
+    post_body += String(accuracy);
+    post_body += "},\"at\":\"";
+    post_body += HTTPtime;
+    post_body += "\",\"severity\":\"";
+    post_body += pmaState;
+    post_body += "\",\"SOC\":\"";
+    post_body += input_soc;
+    post_body += "\",\"chargeState\":\"";
+    post_body += input_chg;
+    post_body += "\"}";
+
+    // char post_body[256];
+    // snprintf(post_body, sizeof(post_body),
+    // "{\"itemId\":\"0001\",\"location\":{\"lat\":%.5f,\"lng\":%.5f,\"accuracy\":%.0f},\"at\":\"%s\",\"severity\":\"%s\"}",
+    // lat, lng, accuracy, time.c_str(), pmaState.c_str());
+
+    Serial.println("---- POST body (debug) ----");
+    Serial.println(post_body);
+    Serial.println("---------------------------");
+
+    // .https_post transmits the HTTPS POST request and returns the HTTP status code (e.g. 200, 400, 500, etc.)
+    int httpCode = modem.https_post(post_body);
+    if (httpCode < 200 || httpCode >= 300)
+    {
+        Serial.print("HTTP post failed! status = ");
+        Serial.println(httpCode);
+        // Optionally print response to see error
+        Serial.print("HTTP body (error): ");
+        Serial.println(modem.https_body());
+        modem.https_end();
+        return;
+    }
+
+    // Get HTTPS response (response from the server) header information
+    String header = modem.https_header();
+    Serial.println("_______________________________________________");
+    Serial.println("Response Header");
+    Serial.println("_______________________________________________");
+    Serial.println(header);
+
+    // Get HTTPS response body information
+    String body = modem.https_body();
+    Serial.println("_______________________________________________");
+    Serial.println("Response body : ");
+    Serial.println("_______________________________________________");
+    Serial.println(body);
+
+    // Disconnect http server
+    modem.https_end();
+    delay(100);
+
+    Serial.println("***********************************************************************************************");
+    Serial.println("End of HTTPS POST request and response");
+    Serial.println("***********************************************************************************************");
+
+    // SerialGPS.end();//restart gps connection
+    // delay(100);
+    // SerialGPS.begin(9600, SERIAL_8N1, BOARD_GPS_RX_PIN, BOARD_GPS_TX_PIN);
+    //delay(postInterval); // wait 15 seconds
+}
+
+float check_angle(float chk_angle)
+{
+  if (chk_angle > 180)
+  {
+      chk_angle = chk_angle - 360;
+  }
+  else if(chk_angle < -180)
+  {
+      chk_angle = chk_angle + 360;
+  }
+  return chk_angle;
+}
+
+float pitch_threshold_angle = 70;
+float roll_threshold_angle = 70;
+float threshold_acc = 8;
+bool check_fall(float roll, float pitch, float ax, float ay, float az)
+{
+  if(pitch < -pitch_threshold_angle && ax > threshold_acc)//left fall
+  { 
+      Serial.println("Left fall");
+      return true;
+  }else if(pitch > pitch_threshold_angle && ax < -threshold_acc)//right fall
+  { 
+      Serial.println("Right fall");
+      return true;
+  }
+  //change to ay if no +90 offset
+  //change to az if +90 offset
+  //else if(roll < -roll_threshold_angle && ay < -threshold_acc)//forward fall
+  else if(roll > roll_threshold_angle && az > threshold_acc)//forward fall
+  { 
+      Serial.println("Forward fall");
+      return true;
+  }
+  //else if(roll > roll_threshold_angle && ay > threshold_acc)//backward fall
+  else if(roll < -roll_threshold_angle && az < -threshold_acc)//backward fall
+  { 
+      Serial.println("Backward fall");
+      return true;
+  }
+  return false;
+}
+
+float pitch_safe_angle = 20;
+float roll_safe_angle = 20;
+bool check_safe(float roll, float pitch)
+{
+  if((pitch > -pitch_safe_angle && pitch < pitch_safe_angle) && (roll > -roll_safe_angle && roll < roll_safe_angle))
+  {
+      Serial.println("PMA returned back to safe position");
+      return true;
+  }
+  return false;
+}
+
+void alert() 
+{
+    Serial.println("Alert sound!");
+    int buzz = 0; //counter for buzzer loop
+    for (buzz=0; buzz<3; buzz++) 
+    {
+        digitalWrite(buzzerPin,LOW);
+        delay(300);
+        digitalWrite(buzzerPin,HIGH);
+        delay(50);
+    }
+    delay(100);
+}
+
+static unsigned long lastChars = 0;
+static unsigned long lastCheck = 0;
+void displayInfo()
+{
+    if (gps.location.isValid() )
+    {
+        latitude = gps.location.lat();     //Storing the Lat. and Lon.
+        longitude = gps.location.lng();
+        bearing = TinyGPSPlus::cardinal(gps.course.value());     // get the direction
+        // Serial.print("LATITUDE:  "); Serial.println(latitude, 6);  // float to x decimal places
+        // Serial.print("LONGITUDE: "); Serial.println(longitude, 6);
+    }
+    if (gps.speed.isValid()) 
+    {
+        velocity = gps.speed.kmph();         //get velocity
+        speed_mps = gps.speed.mps();  // kilometers per hour
+        // Serial.print("VELOCITY: "); Serial.print(velocity); Serial.println("kmph");
+        // Serial.print("SPEED: "); Serial.print(speed_mps); Serial.println("mps");
+    }
+    if (millis() > printTime + printInterval)
+    {
+        printTime = millis();
+        Serial.print("LATITUDE:  "); Serial.println(latitude, 6);  // float to x decimal places
+        Serial.print("LONGITUDE: "); Serial.println(longitude, 6);
+        //Serial.printf("Sending lat: %.6f, lng: %.6f\n", latitude, longitude);
+        //To check if the gps is actually working/updated
+        Serial.println(gps.location.isValid() ? "GPS FIXED" : "NO FIX");
+        Serial.println(gps.charsProcessed()); // shows how many characters TinyGPS++ has parsed
+        Serial.println();
+        if (millis() - lastCheck > 5000) 
+        {
+        lastCheck = millis();
+        if (gps.charsProcessed() == lastChars) 
+        {
+            Serial.println("⚠️ GPS stalled, restarting SerialGPS...");
+            SerialGPS.end();
+            delay(100);
+            //SerialGPS.begin(9600, SERIAL_8N1, BOARD_GPS_RX_PIN, BOARD_GPS_TX_PIN);
+            SerialGPS.begin(9600);
+        }
+        lastChars = gps.charsProcessed();
+        }
+        // String timeStr;
+        // modem.sendAT("+CCLK?");
+        // if (modem.waitResponse(1000, "+CCLK:") == 1) {
+        // timeStr = modem.stream.readStringUntil('\n');
+        // timeStr.trim();
+        // Serial.println("Module time: " + timeStr);
+        // }
+        // SerialAT.println("AT+CTZU?");  // check if automatic time zone update is on
+        // SerialAT.println("AT+CTZU=1"); // enable NITZ auto update
+        //Module time: "25/10/24,15:22:34+32"
+    }
+}
+
+void gpsTask(void *parameter) 
+{
+  for (;;) {
+    while (SerialGPS.available()) 
+    {
+      gps.encode(SerialGPS.read());
+    //   char c = SerialGPS.read(); // debug to see if the gps is reading any raw nmea sentence, to check if gps is updating
+    //   Serial.write(c);
+    }
+    //Serial.println("gpsTask running..."); //debug to see if the task is running
+    vTaskDelay(10 / portTICK_PERIOD_MS); // small delay to yield
+  }
+}
+
+void topple_detectTask(void* parameter) //rtos
+{ 
+    for (;;) {
+        // We use a non-blocking delay to ensure responsiveness
+        mpu.accelUpdate();
+        delay(50);
+        mpu.gyroUpdate();
+        delay(50);
+
+        float ax = mpu.accelX() * g; // convert to m/s^2
+        float ay = mpu.accelY() * g;
+        float az = mpu.accelZ() * g;
+        Accel = sqrt(ax * ax + ay * ay);
+
+        float gx = mpu.gyroX(); // deg/s
+        float gy = mpu.gyroY(); //* M_PI/180.0; //to convert to rad/s
+        float gz = mpu.gyroZ();
+        Gyro = sqrt(gx * gx + gy * gy + gz * gz);
+        
+        //to replace values in the array
+        if (zeroing)
+        { 
+            totalAccel = totalAccel - readingsAccel[count];
+            totalGyro = totalGyro - readingsGyro[count];
+            //Serial.print("Total Accel "); Serial.print(totalAccel); Serial.print(" | Total Gyro "); Serial.println(totalGyro);
+        }
+        readingsAccel[count] = Accel;
+        readingsGyro[count] = Gyro;
+
+        //calculating average
+        totalAccel = totalAccel + readingsAccel[count];
+        totalGyro = totalGyro + readingsGyro[count];
+        count++;
+        if (!zeroing)
+        {
+            ind = count;
+        }
+        averageAccel = totalAccel/ind;
+        averageGyro = totalGyro/ind;
+        // Serial.print("Average Accel: "); Serial.print(averageAccel);
+        // Serial.print(" | Average Gyro: "); Serial.println(averageGyro);
+
+        //to trigger replacing the values
+        if (count >= numReadings)
+        {
+            count = 0;
+            zeroing = true;
+            //Serial.println("reset");
+        }
+
+        //calculate roll and pitch
+        // float roll = atan( ay/sqrt(ax*ax + az*az) )*1 / (3.142/180);
+        // float pitch = -atan( ax/sqrt(ay*ay + az*az) )*1 / (3.142/180);
+
+        float roll = atan( az/sqrt(ax*ax + ay*ay) )*1 / (3.142/180);
+        float pitch = -atan( ax/sqrt(ay*ay + az*az) )*1 / (3.142/180);
+        // Output
+        Serial.print("Roll: "); Serial.print(roll);
+        Serial.print(" | Pitch: "); Serial.println(pitch);
+
+        // --- Accident Detection Logic ---
+        if (millis() - lastUpdateTime > SENSOR_READ_INTERVAL) 
+        {
+
+        // Topple/Overturn Detection
+        if (check_fall(roll, pitch, ax, ay, az) && !potentialFall)
+        {
+        //if (roll > upper_threshold_roll || roll < lower_threshold_roll && !potentialFall){
+            potentialFall = true;
+            fallTime = millis();
+            Serial.println("*************************************************");
+            Serial.println("PMA TOPPLED OR OVERTURNED!");
+            Serial.println("*************************************************");
+            //alert();
+            //delay(100); // Pause after alert to avoid spamming
+        }
+
+        if (potentialFall && check_safe(roll, pitch))
+        { //if the pma has returned into a safe orientation, alarm will stop
+            potentialFall = false;
+            //Serial.println("False alarm");
+        }
+        // Check for impact if a fall has been detected after a certain amount of time
+        // if (millis() - fallTime > stillTime && potentialFall) 
+        // {
+        //     if (averageAccel > FALL_ACCEL_THRESHOLD && az < 8) 
+        //     { //g-force is x or y direction, indicating the PMA has toppled
+        //         Serial.println("*************************************************");
+        //         Serial.println("PMA TOPPLED, ALERT: PMA FALLEN!!!!! (after a few seconds)");
+        //         Serial.println("*************************************************");
+        //         //alert();
+        //     } 
+        //     else 
+        //     {
+        //         if (check_safe(roll, pitch))
+        //         { //if the pma has returned into a safe orientation, alarm will stop
+        //             potentialFall = false;
+        //             //Serial.println("False alarm");
+        //         }
+        //     }
+        //     fallTime = millis();
+        // }
+        lastUpdateTime = millis();
+        }
+        // --- Print Sensor Values to Serial Monitor ---
+        // Serial.print("Accel X: "); Serial.print(ax); Serial.print(" m/s^2, ");
+        // Serial.print("Y: "); Serial.print(ay); Serial.print(" m/s^2, ");
+        // Serial.print("Z: "); Serial.print(az); Serial.println(" m/s^2 ");
+        // Serial.print("Gyro X: "); Serial.print(gx); Serial.print(" deg/s, ");
+        // Serial.print("Y: "); Serial.print(gy); Serial.print(" deg/s, ");
+        // Serial.print("Z: "); Serial.print(gz); Serial.print(" deg/s ");
+        // Serial.print("Roll: "); Serial.print(roll); Serial.print(" deg, ");
+        // Serial.print("Pitch: "); Serial.print(pitch); Serial.println(" deg ");
+        vTaskDelay(looptime / portTICK_PERIOD_MS); // wait .5 seconds
+    }
+}
+
+void alertTask(void* parameter) //rtos
+{ 
+    for (;;) {
+        if (potentialFall){
+            Serial.println("Alert sound!");
+            int buzz = 0; //counter for buzzer loop
+            for (buzz=0; buzz<3; buzz++) 
+            {
+                digitalWrite(buzzerPin,LOW);
+                delay(300);
+                digitalWrite(buzzerPin,HIGH);
+                delay(50);
+            }
+            //delay(100);
+            pmaState = "Toppled";
+        }
+        else
+        {
+            pmaState = "Safe";
+        }
+        vTaskDelay(200 / portTICK_PERIOD_MS); // wait 1 second
+    }
+}
+
+void setup()
+{
+    Serial.begin(115200); // Set console baud rate
+
+    Serial.println("Start Sketch");
+
+    SerialAT.begin(115200, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
+
+#ifdef BOARD_POWERON_PIN
+    /* Set Power control pin output
+     * * @note      Known issues, ESP32 (V1.2) version of T-A7670, T-A7608,
+     *            when using battery power supply mode, BOARD_POWERON_PIN (IO12) must be set to high level after esp32 starts, otherwise a reset will occur.
+     * */
+    pinMode(BOARD_POWERON_PIN, OUTPUT);
+    digitalWrite(BOARD_POWERON_PIN, HIGH);//HIGH
+#endif
+
+    // Set modem reset pin ,reset modem
+#ifdef MODEM_RESET_PIN
+    pinMode(MODEM_RESET_PIN, OUTPUT);
+    digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
+    delay(100);
+    digitalWrite(MODEM_RESET_PIN, MODEM_RESET_LEVEL);
+    delay(2600);
+    digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
+#endif
+    // digitalWrite(MODEM_RESET_PIN, MODEM_RESET_LEVEL);
+    // gpio_hold_en((gpio_num_t)MODEM_RESET_PIN);
+    // gpio_deep_sleep_hold_en();
+
+#ifdef MODEM_FLIGHT_PIN
+    // If there is an airplane mode control, you need to exit airplane mode
+    pinMode(MODEM_FLIGHT_PIN, OUTPUT);
+    digitalWrite(MODEM_FLIGHT_PIN, HIGH);
+#endif
+
+    // Pull down DTR to ensure the modem is not in sleep state
+    pinMode(MODEM_DTR_PIN, OUTPUT);
+    digitalWrite(MODEM_DTR_PIN, LOW);
+
+    // Turn on the modem
+    pinMode(BOARD_PWRKEY_PIN, OUTPUT);
+    digitalWrite(BOARD_PWRKEY_PIN, LOW);
+    delay(100);
+    digitalWrite(BOARD_PWRKEY_PIN, HIGH);
+    delay(100);
+    digitalWrite(BOARD_PWRKEY_PIN, LOW);
+
+    // Check if the modem is online
+    Serial.println("Start modem...");
+
+    int retry = 0;
+    while (!modem.testAT(1000))
+    {
+        Serial.println(".");
+        if (retry++ > 10)
+        {
+            Serial.println("Powering on and off the modem...");
+            digitalWrite(BOARD_PWRKEY_PIN, LOW);
+            delay(100);
+            digitalWrite(BOARD_PWRKEY_PIN, HIGH);
+            delay(1000);
+            digitalWrite(BOARD_PWRKEY_PIN, LOW);
+            retry = 0;
+        }
+    }
+    Serial.println();
+    
+//     #define A7670X_LOG_CAPTURE // Used to capture networking information and restart the modem
+// #ifdef A7670X_LOG_CAPTURE
+//     Serial.println("Restart modem");
+//     // Rset modem
+//     modem.sendAT("+CFUN=6"); // GENERAL KNOWLEDGE! The AT+CFUN command controls the modem's level of functionality (6 soft resets the modem and then brings it back to full functionality)
+//     modem.waitResponse();
+//     // The .waitResponse method is a blocking function that suspends program execution until the modem returns a response to the previously sent AT command,
+//     // ensuring proper command-response synchronization in serial communication with cellular modems.
+//     // GENERAL KNOWLEDGE!  The AT commands follow a standardised response format:
+//     // GENERAL KNOWLEDGE!  AT+COMMAND<CR>           // Command sent
+//     // GENERAL KNOWLEDGE!  <CR><LF>response<CR><LF> // Response received (<CR> is Carriage Return: Moves the cursor to the beginning of the current line, <LF> is Line Feed: Moves the cursor to the beginning of the next line)
+//     // GENERAL KNOWLEDGE!  OK<CR><LF>               // Final result code (Can be OK, ERROR, +CME ERROR, +CMS ERROR, ABORTED, etc.)
+
+//     // Wait modem reset
+//     delay(10000);
+
+//     // Check at respones
+//     while (!modem.testAT(1000))
+//     {
+//         Serial.println(".");
+//     }
+//     Serial.println();
+// #endif
+
+//added
+    // Set ESP32 as a Wi-Fi Station
+    WiFi.mode(WIFI_STA);
+
+    // Print MAC addresses
+    Serial.print("My MAC Address: ");
+    Serial.println(WiFi.macAddress());
+    // Serial.print("Responder MAC Address: ");
+    // char macStr[18];
+    // formatMacAddress(responderAddress, macStr, 18);
+    // Serial.println(macStr);
+
+    // Disconnect from WiFi
+    WiFi.disconnect();
+
+    // Initialize ESP-NOW
+    if (esp_now_init() == ESP_OK)
+    {
+        Serial.println("ESP-NOW Init Success");
+        // Bind the send callback
+        //esp_now_register_send_cb(sendingCallback);
+        esp_now_register_recv_cb(receiveCallback);
+    }
+    else
+    {
+        Serial.println("ESP-NOW Init Failed");
+        delay(3000);
+        ESP.restart();
+    }
+
+//added
+    SerialGPS.begin(9600, SERIAL_8N1, BOARD_GPS_RX_PIN, BOARD_GPS_TX_PIN);
+    //SerialGPS.begin(9600);
+    delay(2000);
+    while (!Serial) {
+      delay(10); // Wait for serial port to connect.
+    }
+
+    Serial.println("PMA Accident Detection System Initializing...");
+    //Wire.begin();
+    Wire.begin(SDA_PIN, SCL_PIN, 100000);
+    delay(1000); // Stabilization delay for GY-91
+
+    pinMode(buzzerPin,OUTPUT);
+    digitalWrite(buzzerPin,HIGH);
+    delay(50);
+
+    // Initialize MPU9250
+    mpu.setWire(&Wire);
+    mpu.beginAccel();
+    mpu.beginGyro();
+    delay(1000);
+
+    // Diagnostic check
+    Wire.beginTransmission(0x68); // MPU9250 default address
+    Wire.write(0x75); // WHO_AM_I register
+    Wire.endTransmission(false);
+    Wire.requestFrom(0x68, 1);
+    if (Wire.available()) {
+    byte whoami = Wire.read();
+    Serial.print("WHO_AM_I: 0x");
+    Serial.println(whoami, HEX);
+    }
+    
+    Serial.println("Initialization Complete. Monitoring for accidents...");
+    Serial.println("----------------------------------------------------");
+
+    Serial.println("Testing TinyGSM modem...");
+    if (modem.testAT()) {
+    Serial.println("✅ Modem responded OK!");
+    } else {
+    Serial.println("❌ No response from modem.");
+    }
+
+    Serial.println("Sending AT...");
+    SerialAT.println("AT");   // directly send to the modem
+    SerialAT.flush();
+    unsigned long start = millis();
+
+    while (millis() - start < 2000) {  // wait up to 2s for a reply
+        while (SerialAT.available()) {
+            char c = SerialAT.read();
+            Serial.write(c);  // echo modem's raw reply
+        }
+    }
+    Serial.println("Done checking AT.");
+
+    modem.sendAT("");
+    delay(200);
+    while (modem.stream.available()) Serial.write(modem.stream.read());
+    // Check if SIM card is online
+    SimStatus sim = SIM_ERROR;
+    while (sim != SIM_READY)
+    {
+        sim = modem.getSimStatus();
+        Serial.println("Checking SIM card status...");
+        Serial.printf("SIM status: %d\n", sim);
+        switch (sim)
+        {
+        case SIM_READY:
+            Serial.println("SIM card online");
+            break;
+        case SIM_LOCKED:
+            Serial.println("The SIM card is locked. Please unlock the SIM card first.");
+            // const char *SIMCARD_PIN_CODE = "123456";
+            // modem.simUnlock(SIMCARD_PIN_CODE);
+            break;
+        default:
+            Serial.println("❌ SIM not detected or communication error.");
+            SerialAT.println("AT+CPIN?");
+            modem.sendAT("+CPIN?");
+            delay(500);
+            //modem.waitResponse(1000, "OK");
+            unsigned long start = millis();
+            while (millis() - start < 3000) {
+            while (modem.stream.available()) 
+            {
+                String line = modem.stream.readStringUntil('\n');
+                line.trim();
+                if (line.length()) 
+                {
+                    Serial.println(">> " + line);
+                }
+            }
+            }
+            break;
+        }
+        delay(1000);
+    }
+
+    // SIM7672G Can't set network mode
+// #ifndef TINY_GSM_MODEM_SIM7672
+//     if (!modem.setNetworkMode(MODEM_NETWORK_AUTO))
+//     {
+//         Serial.println("Set network mode failed!");
+//     }
+//     String mode = modem.getNetworkModes();
+//     Serial.print("Current network mode : ");
+//     Serial.println(mode);
+// #endif
+
+#ifdef NETWORK_APN
+    Serial.printf("Set network apn : %s\n", NETWORK_APN);
+    modem.sendAT(GF("+CGDCONT=1,\"IP\",\""), NETWORK_APN, "\"");
+    if (modem.waitResponse() != 1)
+    {
+        Serial.println("Set network apn error !");
+    }
+#endif
+
+    // Check network registration status and network signal status
+    int16_t sq;
+    Serial.print("Wait for the modem to register with the network.");
+    RegStatus status = REG_NO_RESULT;
+    while (status == REG_NO_RESULT || status == REG_SEARCHING || status == REG_UNREGISTERED)
+    {
+        status = modem.getRegistrationStatus();
+        switch (status)
+        {
+        case REG_UNREGISTERED:
+        case REG_SEARCHING:
+            sq = modem.getSignalQuality();
+            Serial.printf("[%lu] Signal Quality:%d\n", millis() / 1000, sq);
+            delay(1000);
+            break;
+        case REG_DENIED:
+            Serial.println("Network registration was rejected, please check if the APN is correct");
+            return;
+        case REG_OK_HOME:
+            Serial.println("Online registration successful");
+            break;
+        case REG_OK_ROAMING:
+            Serial.println("Network registration successful, currently in roaming mode");
+            break;
+        default:
+            Serial.printf("Registration Status:%d\n", status);
+            delay(1000);
+            break;
+        }
+    }
+    Serial.println();
+
+#ifdef MODEM_REG_SMS_ONLY
+    while (status == REG_SMS_ONLY)
+    {
+        Serial.println("Registered for \"SMS only\", home network (applicable only when E-UTRAN), this type of registration cannot access the network. Please check the APN settings and ask the operator for the correct APN information and the balance and package of the SIM card. If you still cannot connect, please replace the SIM card and test again. Related ISSUE: https://github.com/Xinyuan-LilyGO/LilyGO-T-A76XX/issues/307#issuecomment-3034800353");
+        delay(5000);
+    }
+#endif
+
+    Serial.printf("Registration Status:%d\n", status);
+    delay(1000);
+
+    String ueInfo;
+    if (modem.getSystemInformation(ueInfo))
+    {
+        Serial.print("Inquiring UE system information:");
+        Serial.println(ueInfo);
+    }
+
+    if (!modem.setNetworkActive())
+    {
+        Serial.println("Enable network failed!");
+    }
+
+    delay(5000);
+
+    String ipAddress = modem.getLocalIP();
+    Serial.print("Network IP:");
+    Serial.println(ipAddress);
+
+    // Note - The above is similar to that in Network.ino
+
+    // // Initialize HTTPS
+    // modem.https_begin();
+
+    // // Set GET URT
+    // if (!modem.https_set_url(server_url))
+    // {
+    //     Serial.println("Failed to set the URL. Please check the validity of the URL!");
+    //     return;
+    // }
+
+    // // Build the HTTPS POST request header (the below are just some random header examples)
+    // // modem.https_add_header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6");
+    // // modem.https_add_header("Accept-Encoding", "gzip, deflate, br");
+
+    // modem.https_add_header("Content-Type", "application/json");
+    // modem.https_add_header("Accept", "application/json");
+
+    // // modem.https_set_user_agent("TinyGSM/LilyGo-A76XX");
+
+    // // Build the HTTPS POST request body
+    // String post_body = "This is post example!";
+    // String post_body = String("{\"itemId\":\"0009\",") + "\"location\":{\"lat\":1.35210,\"lng\":103.81980,\"accuracy\":12}," + "\"at\":\"2025-08-09T10:22:00+08:00\"," + "\"severity\":\"warning\"}";
+    // String post_body = String("{\"itemId\":\"0009\",") + "\"location\":{\"lat\":" + String(gps.location.lat(), 6) + ",\"lng\":" + String(gps.location.lng(), 6)+ ",\"accuracy\":" + String(gps.satellites.value())+ "}," + "\"at\":\"2025-08-09T10:22:00+08:00\"," + "\"severity\":" + pmaState + "}";
+
+    // Serial.println("---- POST body (debug) ----");
+    // Serial.println(post_body);
+    // Serial.println("---------------------------");
+
+    // // // .https_post transmits the HTTPS POST request and returns the HTTP status code (e.g. 200, 400, 500, etc.)
+    // int httpCode = modem.https_post(post_body);
+    // if (httpCode < 200 || httpCode >= 300)
+    // {
+    //     Serial.print("HTTP post failed! status = ");
+    //     Serial.println(httpCode);
+    //     // Optionally print response to see error
+    //     Serial.print("HTTP body (error): ");
+    //     Serial.println(modem.https_body());
+    //     modem.https_end();
+    //     return;
+    // }
+
+    // Serial.println("***********************************************************************************************");
+    // Serial.println("Response to the HTTPS POST request");
+    // Serial.println("***********************************************************************************************");
+
+    // // // Get HTTPS response (response from the server) header information
+    // String header = modem.https_header();
+    // Serial.println("_______________________________________________");
+    // Serial.println("Response Header");
+    // Serial.println("_______________________________________________");
+    // Serial.println(header);
+
+    // // // Get HTTPS response body information
+    // String body = modem.https_body();
+    // Serial.println("_______________________________________________");
+    // Serial.println("Response body : ");
+    // Serial.println("_______________________________________________");
+    // Serial.println(body);
+
+    // // // Disconnect http server
+    // modem.https_end();
+
+    // Serial.println("***********************************************************************************************");
+    // Serial.println("End of HTTPS POST request and response");
+    // Serial.println("***********************************************************************************************");
+
+//added
+    lastUpdateTime = millis();
+
+    modem.sendAT("+CCLK?");
+    if (modem.waitResponse(1000, "+CCLK:") == 1) {
+    timeStr = modem.stream.readStringUntil('\n');
+    timeStr.trim();
+    Serial.println("Module time: " + timeStr);
+    }
+    SerialAT.println("AT+CTZU?");  // check if automatic time zone update is on
+    SerialAT.println("AT+CTZU=1"); // enable NITZ auto update
+
+    // xTaskCreate(
+    // relayTask,       // Task function
+    // "RelayTask",     // Name
+    // 8192,           // Stack size
+    // NULL,           // Parameters
+    // 1,              // Priority
+    // NULL            // Task handle
+    // );
+
+    xTaskCreate(
+    gpsTask,
+    "GPSTask",
+    4096,
+    NULL,
+    3,     // Highest priority
+    NULL
+    );
+
+    xTaskCreate(
+    topple_detectTask,
+    "Topple_DetectTask",
+    4096,
+    NULL,
+    2,     // Lower priority than GPSTask
+    NULL
+    );
+    delay(10000); // Wait for tasks to initialize
+
+    xTaskCreate(
+    alertTask,
+    "AlertTask",
+    4096,
+    NULL,
+    1,     // Lower priority than Topple_DetectTask
+    NULL
+    );
+    delay(3000); // Wait for tasks to initialize
+}
+
+void loop()
+{
+    //added
+    displayInfo();  
+    // if (potentialFall){
+    //     alert();
+    //     pmaState = "Toppled";
+    // }else{
+    //     pmaState = "Safe";
+    // }
+    if (millis() - postTime > postInterval)//call it once every interval
+    { 
+        Serial.println("Posting data...");
+        postData(); //commented out to use rtos task instead
+        postTime = millis();
+        Serial.println("Post data done.");
+    }
+
+    // Debug AT
+    if (SerialAT.available())
+    {
+        Serial.write(SerialAT.read());
+    }
+    if (Serial.available())
+    {
+        SerialAT.write(Serial.read());
+    }
+    delay(1);
+}
+
+#ifndef TINY_GSM_FORK_LIBRARY
+#error "No correct definition detected, Please copy all the [lib directories](https://github.com/Xinyuan-LilyGO/LilyGO-T-A76XX/tree/main/lib) to the arduino libraries directory , See README"
+#endif
+/*
+SIM7600 Version OK 20250709
+AT+SIMCOMATI
+Manufacturer: SIMCOM INCORPORATED
+Model: SIMCOM_SIM7600G-H
+Revision: LE20B04SIM7600G22
+QCN:
+IMEI: xxxxxxxxxxxx
+MEID:
++GCAP: +CGSM
+DeviceInfo: 173,170
+
+SIM7000G    # 2025/07/10:OK!
+Revision:1529B11SIM7000G
+CSUB:V01
+APRev:1529B11SIM7000,V01
+QCN:MDM9206_TX3.0.SIM7000G_P1.03C_20240911
+
+Revision:1529B11SIM7000G
+CSUB:V01
+APRev:1529B11SIM7000,V01
+QCN:MDM9206_TX3.0.SIM7000G_P1.02_20180726
+*/
